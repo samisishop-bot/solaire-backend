@@ -1,4 +1,4 @@
- const express = require('express');
+const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 
@@ -16,18 +16,18 @@ app.post('/api/dimensionner', async (req, res) => {
     const { appareils } = req.body;
 
     if (!appareils || !Array.isArray(appareils) || appareils.length === 0) {
-      return res.status(400).json({ error: "Veuillez fournir une liste d'appareils." });
+      return res.status(400).json({ error: "Veuillez fournir une liste d'appareils validée." });
     }
 
     let energieJournaliereWh = 0;
     let puissancePointeW = 0;
     let aDesChargesInductives = false;
 
-    // Calcul de l'énergie et de la puissance de pointe
+    // Calcul sécurisé
     appareils.forEach(app => {
-      const qte = app.quantite || 1;
-      const puissance = app.puissance_w * qte;
-      const heures = app.heures_jour || 0;
+      const qte = Number(app.quantite) || 1;
+      const puissance = Number(app.puissance_w || app.puissance_watts) || 0;
+      const heures = Number(app.heures_jour) || 0;
 
       energieJournaliereWh += puissance * heures;
 
@@ -47,7 +47,7 @@ app.post('/api/dimensionner', async (req, res) => {
       tensionRecommandee = 24;
     }
 
-    // 1. Sélection de l'onduleur optimal le moins cher pour le besoin
+    // 1. Sélection de l'onduleur
     const onduleurQuery = `
       SELECT * FROM equipements 
       WHERE type = 'onduleur' 
@@ -59,7 +59,7 @@ app.post('/api/dimensionner', async (req, res) => {
     let onduleurRes = await pool.query(onduleurQuery, [puissancePointeW, tensionRecommandee]);
     let onduleur = onduleurRes.rows[0];
 
-    // Fallback si besoin > catalogue 12V/24V
+    // Fallback si aucun modèle ne correspond exactement à la tension
     if (!onduleur) {
       const fallbackQuery = `
         SELECT * FROM equipements 
@@ -72,8 +72,8 @@ app.post('/api/dimensionner', async (req, res) => {
       onduleur = fallbackRes.rows[0] || "Aucun onduleur correspondant en stock";
     }
 
-    // 2. Sélection de la batterie SUNC adaptée à la tension système
-    const tensionBatterie = onduleur && onduleur.tension_v ? onduleur.tension_v : tensionRecommandee;
+    // 2. Sélection de la batterie SUNC
+    const tensionBatterie = (onduleur && onduleur.tension_v) ? onduleur.tension_v : tensionRecommandee;
     const batterieQuery = `
       SELECT * FROM equipements 
       WHERE type = 'batterie' 
@@ -100,7 +100,7 @@ app.post('/api/dimensionner', async (req, res) => {
 
   } catch (err) {
     console.error("Erreur calcul backend:", err);
-    res.status(500).json({ error: "Erreur interne lors du calcul du dimensionnement." });
+    res.status(500).json({ error: "Erreur interne lors du calcul du dimensionnement.", details: err.message });
   }
 });
 
