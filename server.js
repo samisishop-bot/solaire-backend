@@ -1,80 +1,100 @@
  const express = require('express');
-const cors = require('cors');
 const { Pool } = require('pg');
+const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(express.json());
 
-// Connexion à la base de données PostgreSQL Neon.tech
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Route de test
-app.get('/', (req, res) => {
-  res.json({ status: "OK", message: "API Solaire Sam Business GROUP opérationnelle" });
-});
-
-// Route principale : Calcul du dimensionnement
 app.post('/api/dimensionner', async (req, res) => {
   try {
-    const { appareils } = req.body; 
+    const { appareils } = req.body;
 
     if (!appareils || !Array.isArray(appareils) || appareils.length === 0) {
-      return res.status(400).json({ error: "Veuillez fournir une liste d'appareils valide." });
+      return res.status(400).json({ error: "Veuillez fournir une liste d'appareils." });
     }
 
-    let energieTotaleWh = 0;
+    let energieJournaliereWh = 0;
     let puissancePointeW = 0;
-    let aDesChargeInductives = false;
+    let aDesChargesInductives = false;
 
+    // Calcul de l'énergie et de la puissance de pointe
     appareils.forEach(app => {
       const qte = app.quantite || 1;
-      const pUnit = app.puissance_w;
-      const hJour = app.heures_jour;
-      
-      // Facteur de démarrage (x3 pour appareils inductifs / moteurs)
-      const facteurDemarrage = app.est_inductif ? 3 : 1;
-      if (app.est_inductif) aDesChargeInductives = true;
+      const puissance = app.puissance_w * qte;
+      const heures = app.heures_jour || 0;
 
-      energieTotaleWh += (pUnit * qte * hJour);
-      puissancePointeW += (pUnit * qte * facteurDemarrage);
+      energieJournaliereWh += puissance * heures;
+
+      if (app.est_inductif) {
+        puissancePointeW += puissance * 3; // Coefficient x3 pour surtension
+        aDesChargesInductives = true;
+      } else {
+        puissancePointeW += puissance;
+      }
     });
 
-    // Seuil de tension système (Togo / Standard off-grid)
-    let tensionBatterieV = 24;
-    if (puissancePointeW > 6000 || (aDesChargeInductives && puissancePointeW > 3000)) {
-      tensionBatterieV = 48;
-    } else if (puissancePointeW <= 1500) {
-      tensionBatterieV = 12;
+    // Seuil de tension selon le matériel Felicity en stock
+    let tensionRecommandee = 12;
+    if (puissancePointeW > 3200) {
+      tensionRecommandee = 48;
+    } else if (puissancePointeW > 1000) {
+      tensionRecommandee = 24;
     }
 
-    // Récupération des équipements compatibles en BDD (Neon)
-    const onduleursRes = await pool.query(
-      "SELECT * FROM equipements WHERE type = 'onduleur' AND puissance_va >= $1 AND tension_v = $2 ORDER BY puissance_va ASC LIMIT 1",
-      [puissancePointeW, tensionBatterieV]
-    );
+    // 1. Sélection de l'onduleur optimal le moins cher pour le besoin
+    const onduleurQuery = `
+      SELECT * FROM equipements 
+      WHERE type = 'onduleur' 
+        AND puissance_va >= $1 
+        AND tension_v = $2
+      ORDER BY puissance_va ASC, prix_fcfa ASC 
+      LIMIT 1;
+    `;
+    let onduleurRes = await pool.query(onduleurQuery, [puissancePointeW, tensionRecommandee]);
+    let onduleur = onduleurRes.rows[0];
 
-    const batteriesRes = await pool.query(
-      "SELECT * FROM equipements WHERE type = 'batterie' AND tension_v = $1 ORDER BY capacite_ah DESC",
-      [tensionBatterieV]
-    );
+    // Fallback si besoin > catalogue 12V/24V
+    if (!onduleur) {
+      const fallbackQuery = `
+        SELECT * FROM equipements 
+        WHERE type = 'onduleur' 
+          AND puissance_va >= $1 
+        ORDER BY puissance_va ASC, prix_fcfa ASC 
+        LIMIT 1;
+      `;
+      const fallbackRes = await pool.query(fallbackQuery, [puissancePointeW]);
+      onduleur = fallbackRes.rows[0] || "Aucun onduleur correspondant en stock";
+    }
+
+    // 2. Sélection de la batterie SUNC adaptée à la tension système
+    const tensionBatterie = onduleur && onduleur.tension_v ? onduleur.tension_v : tensionRecommandee;
+    const batterieQuery = `
+      SELECT * FROM equipements 
+      WHERE type = 'batterie' 
+        AND tension_v = $1
+      ORDER BY capacite_wh DESC 
+      LIMIT 1;
+    `;
+    const batterieRes = await pool.query(batterieQuery, [tensionBatterie]);
+    const batterie = batterieRes.rows[0] || "Aucune batterie correspondante en stock";
 
     res.json({
       succes: true,
       bilan_energetique: {
-        energie_journaliere_wh: energieTotaleWh,
+        energie_journaliere_wh: energieJournaliereWh,
         puissance_pointe_w: puissancePointeW,
-        tension_systeme_recommandee_v: tensionBatterieV,
-        contrainte_inductive: aDesChargeInductives
+        tension_systeme_recommandee_v: tensionBatterie,
+        contrainte_inductive: aDesChargesInductives
       },
       recommandations: {
-        onduleur: onduleursRes.rows[0] || "Aucun onduleur exact trouvé en stock, privilégier la gamme supérieure.",
-        batteries_compatibles: batteriesRes.rows
+        onduleur: onduleur,
+        batterie: batterie
       }
     });
 
@@ -84,6 +104,7 @@ app.post('/api/dimensionner', async (req, res) => {
   }
 });
 
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Serveur démarré sur le port ${PORT}`);
 });
