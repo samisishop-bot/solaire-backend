@@ -1,110 +1,73 @@
 const express = require('express');
-const { Pool } = require('pg');
 const cors = require('cors');
-
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+// Catalogue et Tarifs sécurisés (uniquement visibles côté serveur)
+const stockFelicitySunc = {
+  onduleurs: [
+    { model: "Onduleur 1kVA 12V IVCM Monophasé Felicity", kva: 1, price: 115000 },
+    { model: "Onduleur 2kVA 24V PRO IVCM Monophasé Felicity", kva: 2, price: 144500 },
+    { model: "Onduleur 3kVA 24V IVCM Monophasé Felicity", kva: 3, price: 185000 },
+    { model: "Onduleur 3.2kVA 24V IVCM Monophasé Felicity", kva: 3.2, price: 180000 },
+    { model: "Onduleur 3kVA 24V IVEM Monophasé Felicity", kva: 3, price: 195000 },
+    { model: "Onduleur 6kVA 48V IVAM WiFi 2-MPPT Monophasé Felicity", kva: 6, price: 293000 },
+    { model: "Onduleur 8kVA 48V Monophasé Felicity", kva: 8, price: 395000 },
+    { model: "Onduleur 8kVA 48V IVBM Monophasé Felicity", kva: 423000 },
+    { model: "Onduleur 10kVA 48V IVBM IP65 Monophasé Felicity", kva: 10, price: 478000 },
+    { model: "Onduleur 12kVA 48V IVEM Monophasé Felicity", kva: 12, price: 505000 },
+    { model: "Onduleur 10kVA 48V IVPM Monophasé Felicity", kva: 10, price: 515000 },
+    { model: "Onduleur 10kVA 48V IVGM Triphasé Felicity", kva: 10, price: 790000 },
+    { model: "Onduleur Hybride 30kVA IVGM Triphasé Felicity", kva: 30, price: "Sur devis" },
+    { model: "Onduleur Hybride 50kVA IVGM Triphasé Felicity", kva: 50, price: "Sur devis" }
+  ],
+  batteries: [
+    { model: "BATTERIE LITHIUM 12,8V 100Ah SUNC", kwh: 1.28, price: 88500 },
+    { model: "BATTERIE LITHIUM 12,8V 200Ah SUNC", kwh: 2.56, price: 142000 },
+    { model: "BATTERIE LITHIUM 12,8V 300Ah SUNC", kwh: 3.84, price: 165000 },
+    { model: "Batterie Lithium Sunc 48V 10kWh", kwh: 10, price: 680000 },
+    { model: "Batterie Lithium Sunc Écran Tactile 48V 10kWh", kwh: 10, price: 705000 },
+    { model: "Batterie Lithium Sunc Écran Tactile 48V 15kWh", kwh: 15, price: 835000 }
+  ]
+};
+
+// Route API sécurisée
+app.post('/api/dimensionner', (req, res) => {
+  const { appareils, psh = 4.8, autonomie = 1, pr = 0.85 } = req.body;
+
+  let puissanceNominale = 0;
+  let puissanceInrush = 0;
+  let energieWh = 0;
+
+  appareils.forEach(app => {
+    const pTotal = app.puissance * app.qte;
+    puissanceNominale += pTotal;
+    energieWh += pTotal * app.heures;
+    const facteur = app.inductif ? 3.5 : 1.0;
+    puissanceInrush += pTotal * facteur;
+  });
+
+  const perteVideWh = 60 * 24;
+  const energieEfficace = (energieWh + perteVideWh) / pr;
+  const puissancePvWc = Math.ceil(energieEfficace / psh);
+  const nbPanneaux = Math.ceil(puissancePvWc / 550);
+
+  const onduleur = stockFelicitySunc.onduleurs.find(o => (o.kva * 1000) >= puissanceInrush) || stockFelicitySunc.onduleurs[stockFelicitySunc.onduleurs.length - 1];
+  const besoinBatterieKwh = ((energieEfficace * autonomie) / 1000) / 0.8;
+  const batterie = stockFelicitySunc.batteries.find(b => b.kwh >= besoinBatterieKwh) || stockFelicitySunc.batteries[stockFelicitySunc.batteries.length - 1];
+
+  res.json({
+    puissanceNominale,
+    puissanceInrush: Math.round(puissanceInrush),
+    energieKwh: (energieWh / 1000).toFixed(2),
+    puissancePvWc,
+    nbPanneaux,
+    onduleur,
+    batterie
+  });
 });
 
-app.post('/api/dimensionner', async (req, res) => {
-  try {
-    const { appareils } = req.body;
-
-    if (!appareils || !Array.isArray(appareils) || appareils.length === 0) {
-      return res.status(400).json({ error: "Veuillez fournir une liste d'appareils validée." });
-    }
-
-    let energieJournaliereWh = 0;
-    let puissancePointeW = 0;
-    let aDesChargesInductives = false;
-
-    // Calcul sécurisé
-    appareils.forEach(app => {
-      const qte = Number(app.quantite) || 1;
-      const puissance = Number(app.puissance_w || app.puissance_watts) || 0;
-      const heures = Number(app.heures_jour) || 0;
-
-      energieJournaliereWh += puissance * heures;
-
-      if (app.est_inductif) {
-        puissancePointeW += puissance * 3; // Coefficient x3 pour surtension
-        aDesChargesInductives = true;
-      } else {
-        puissancePointeW += puissance;
-      }
-    });
-
-    // Seuil de tension selon le matériel Felicity en stock
-    let tensionRecommandee = 12;
-    if (puissancePointeW > 3200) {
-      tensionRecommandee = 48;
-    } else if (puissancePointeW > 1000) {
-      tensionRecommandee = 24;
-    }
-
-    // 1. Sélection de l'onduleur
-    const onduleurQuery = `
-      SELECT * FROM equipements 
-      WHERE type = 'onduleur' 
-        AND puissance_va >= $1 
-        AND tension_v = $2
-      ORDER BY puissance_va ASC, prix_fcfa ASC 
-      LIMIT 1;
-    `;
-    let onduleurRes = await pool.query(onduleurQuery, [puissancePointeW, tensionRecommandee]);
-    let onduleur = onduleurRes.rows[0];
-
-    // Fallback si aucun modèle ne correspond exactement à la tension
-    if (!onduleur) {
-      const fallbackQuery = `
-        SELECT * FROM equipements 
-        WHERE type = 'onduleur' 
-          AND puissance_va >= $1 
-        ORDER BY puissance_va ASC, prix_fcfa ASC 
-        LIMIT 1;
-      `;
-      const fallbackRes = await pool.query(fallbackQuery, [puissancePointeW]);
-      onduleur = fallbackRes.rows[0] || "Aucun onduleur correspondant en stock";
-    }
-
-    // 2. Sélection de la batterie SUNC
-    const tensionBatterie = (onduleur && onduleur.tension_v) ? onduleur.tension_v : tensionRecommandee;
-    const batterieQuery = `
-      SELECT * FROM equipements 
-      WHERE type = 'batterie' 
-        AND tension_v = $1
-      ORDER BY capacite_wh DESC 
-      LIMIT 1;
-    `;
-    const batterieRes = await pool.query(batterieQuery, [tensionBatterie]);
-    const batterie = batterieRes.rows[0] || "Aucune batterie correspondante en stock";
-
-    res.json({
-      succes: true,
-      bilan_energetique: {
-        energie_journaliere_wh: energieJournaliereWh,
-        puissance_pointe_w: puissancePointeW,
-        tension_systeme_recommandee_v: tensionBatterie,
-        contrainte_inductive: aDesChargesInductives
-      },
-      recommandations: {
-        onduleur: onduleur,
-        batterie: batterie
-      }
-    });
-
-  } catch (err) {
-    console.error("Erreur calcul backend:", err);
-    res.status(500).json({ error: "Erreur interne lors du calcul du dimensionnement.", details: err.message });
-  }
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Serveur démarré sur le port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Serveur actif sur le port ${PORT}`));
